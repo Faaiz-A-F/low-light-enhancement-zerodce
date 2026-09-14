@@ -13,3 +13,4 @@ lpips
 piq
 streamlit
 opencv-python-headless
+pyiqa
