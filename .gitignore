@@ -1,3 +1,4 @@
 archive.zip
 .venv/
+.devcontainers/
 __pycache__/
