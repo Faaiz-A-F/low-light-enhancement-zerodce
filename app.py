@@ -116,11 +116,13 @@ class DenoiseHead(nn.Module):
 
 
 def exposure_gate(x, low=0.15, high=0.55):
-    """Global strength multiplier for a_map. 1.0 for genuinely dark images
-    (mean brightness at/below `low`), smoothly fading to 0.0 as the image's
-    own average brightness approaches `high` -- so already-well-lit input
-    gets little to no enhancement, instead of the network always assuming
-    it's looking at a dark LOL-v2-style crop."""
+    """Global strength multiplier for a_map, based on the WHOLE image's own
+    mean brightness (not per-pixel). 1.0 for genuinely dark images (mean at
+    or below `low`), fading smoothly to 0.0 as the image's own average
+    brightness approaches `high`. The network only ever saw dark LOL-v2
+    crops during training, so on already-well-lit input it still tries to
+    brighten hard -- this keeps that from happening, without needing to
+    retrain, since it's a deterministic function of the input alone."""
     mean_brightness = x.mean(dim=[1, 2, 3], keepdim=True)
     return torch.clamp((high - mean_brightness) / (high - low), 0.0, 1.0)
 
@@ -142,7 +144,8 @@ def enhance_image_with_curve(x, a_map, iterations=8, max_exposure=0.95, knee=0.1
 
 
 # ──────────────────────────────────────────────────────────────────
-# Model loading
+# Model loading (cached so it only happens once per config, not per
+# upload / per slider drag)
 # ──────────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner="Loading model...")
@@ -165,23 +168,29 @@ def load_model(checkpoint_path, se_positions, reduction, se_activation, se_gate,
 
 
 def run_inference(image: Image.Image, model, denoise_head, device, max_exposure, knee,
-                  use_gate=True, gate_low=0.15, gate_high=0.55):
+                   use_exposure_gate=True, gate_low=0.15, gate_high=0.55,
+                   use_bilateral=False, bilateral_d=9, bilateral_sigma=75):
     inp = TF.to_tensor(image.convert('RGB')).unsqueeze(0).to(device)
     with torch.no_grad():
         a_map = model(inp)
-        
-        gate_val = 1.0
-        if use_gate:
-            gate_tensor = exposure_gate(inp, low=gate_low, high=gate_high)
-            gate_val = gate_tensor.item()
-            a_map = a_map * gate_tensor
-
+        gate_value = None
+        if use_exposure_gate:
+            gate = exposure_gate(inp, low=gate_low, high=gate_high)
+            gate_value = gate.item()
+            a_map = a_map * gate
         enhanced = enhance_image_with_curve(inp, a_map, max_exposure=max_exposure, knee=knee)
         if denoise_head is not None:
             enhanced = denoise_head(enhanced)
-            
     enhanced_np = enhanced.squeeze(0).cpu().permute(1, 2, 0).clamp(0, 1).numpy()
-    return (enhanced_np * 255).astype(np.uint8), gate_val
+    enhanced_np = (enhanced_np * 255).astype(np.uint8)
+
+    if use_bilateral:
+        import cv2
+        bgr = cv2.cvtColor(enhanced_np, cv2.COLOR_RGB2BGR)
+        bgr = cv2.bilateralFilter(bgr, d=bilateral_d, sigmaColor=bilateral_sigma, sigmaSpace=bilateral_sigma)
+        enhanced_np = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    return enhanced_np, gate_value
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -202,19 +211,27 @@ with st.sidebar:
     se_gate = st.selectbox("SE gate", ["sigmoid", "hardsigmoid"], index=0)
     use_denoiser = st.checkbox("Use trained DenoiseHead", value=True)
 
-    st.header("Exposure Gate")
-    use_gate = st.checkbox("Enable exposure gating", value=True,
-                           help="Fades out enhancement strength as input brightness rises.")
-    gate_low = st.slider("Gate low threshold", min_value=0.0, max_value=0.5, value=0.15, step=0.01,
-                         help="Images at or below this brightness receive 100% enhancement.")
-    gate_high = st.slider("Gate high threshold", min_value=0.2, max_value=1.0, value=0.55, step=0.01,
-                          help="Images at or above this brightness receive 0% enhancement.")
-    if gate_low >= gate_high:
-        st.warning("Gate Low must be lower than Gate High.")
-
     st.header("Exposure ceiling")
     max_exposure = st.slider("MAX_EXPOSURE", min_value=0.80, max_value=1.00, value=0.95, step=0.01)
     knee = st.slider("knee", min_value=0.02, max_value=0.30, value=0.10, step=0.01)
+
+    st.header("Global exposure gate")
+    st.caption("Dampens enhancement on already-well-lit input. Pure inference-time "
+               "fix, no retraining needed.")
+    use_exposure_gate = st.checkbox("Enable exposure gate", value=True)
+    gate_low = st.slider("gate: fully-dark threshold", min_value=0.05, max_value=0.40,
+                          value=0.15, step=0.01, disabled=not use_exposure_gate)
+    gate_high = st.slider("gate: fully-off threshold", min_value=0.30, max_value=0.80,
+                           value=0.55, step=0.01, disabled=not use_exposure_gate)
+
+    st.header("Real-world noise fallback")
+    st.caption("DenoiseHead is trained only on LOL-v2's noise profile. For phone "
+               "photos with different noise/JPEG-block artifacts, add this on top.")
+    use_bilateral = st.checkbox("Apply bilateral filter after enhancement", value=False)
+    bilateral_d = st.slider("Bilateral d", min_value=3, max_value=15, value=9, step=2,
+                             disabled=not use_bilateral)
+    bilateral_sigma = st.slider("Bilateral sigma", min_value=25, max_value=150, value=75,
+                                 step=5, disabled=not use_bilateral)
 
 uploaded = st.file_uploader("Upload a photo", type=["jpg", "jpeg", "png", "bmp"])
 
@@ -235,23 +252,22 @@ if uploaded is not None:
 
     image = Image.open(uploaded)
     with st.spinner("Enhancing..."):
-        enhanced_np, gate_val = run_inference(
+        enhanced_np, gate_value = run_inference(
             image, model, denoise_head, device, max_exposure, knee,
-            use_gate=use_gate, gate_low=gate_low, gate_high=gate_high
+            use_exposure_gate=use_exposure_gate, gate_low=gate_low, gate_high=gate_high,
+            use_bilateral=use_bilateral, bilateral_d=bilateral_d, bilateral_sigma=bilateral_sigma,
         )
 
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Input")
         st.image(image, use_container_width=True)
-        in_mean = np.array(image.convert('RGB')).mean() / 255
-        st.caption(f"Mean brightness: {in_mean:.3f}")
-        if use_gate:
-            st.caption(f"Gate scale factor applied: `{gate_val * 100:.1f}%`")
+        st.caption(f"Mean brightness: {np.array(image.convert('RGB')).mean() / 255:.3f}")
     with col2:
         st.subheader("Enhanced")
         st.image(enhanced_np, use_container_width=True)
-        st.caption(f"Mean brightness: {enhanced_np.mean() / 255:.3f}")
+        gate_note = f" | exposure gate strength: {gate_value:.2f}" if gate_value is not None else ""
+        st.caption(f"Mean brightness: {enhanced_np.mean() / 255:.3f}{gate_note}")
 
     buf = io.BytesIO()
     Image.fromarray(enhanced_np).save(buf, format="PNG")
