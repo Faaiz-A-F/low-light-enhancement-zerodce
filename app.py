@@ -203,7 +203,7 @@ st.title("Zero-DCE++ with SE-Block + DenoiseHead — Test Your Own Photo")
 with st.sidebar:
     st.header("Model config")
     st.caption("Must match whatever your checkpoint was actually trained with.")
-    checkpoint_path = st.text_input("Checkpoint path", value="best_zerodce_pp_seblock_v9.pth")
+    checkpoint_path = st.text_input("Checkpoint path", value="best_zerodce_pp_seblock_v11.pth")
     se_positions_str = st.text_input("SE positions (comma-separated)", value="3")
     se_positions = tuple(int(p.strip()) for p in se_positions_str.split(",") if p.strip())
     reduction = st.number_input("SE reduction", min_value=1, value=4, step=1)
